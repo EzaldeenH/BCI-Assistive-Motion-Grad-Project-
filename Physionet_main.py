@@ -14,6 +14,7 @@ from sklearn.manifold import TSNE
 from sklearn.model_selection import StratifiedKFold
 
 import models
+from losses.center_loss import get_center_loss_model_losses
 from Physionet_DataLoad import load_physionet, load_physionet_raw, standardize_data
 
 
@@ -307,6 +308,44 @@ def getModel(model_name):
 
             tcn_activation='elu',
         )
+    elif (model_name == 'DB_ATCNet_CenterLoss'):
+        # Train using DB-ATCNet with Center Loss for improved intra-class compactness
+        model = models.DB_ATCNet_CenterLoss(
+            # Dataset parameters
+            n_classes=4,
+            in_chans=64,
+            in_samples=640,
+
+            # Attention Dual-branch Convolution block (ADBC) parameters
+            eegn_F1=16,
+            eegn_D=2,
+            eegn_kernelSize=64,
+            eegn_poolSize=7,
+            eegn_dropout=0.3,
+            drop1=0.35,
+            depth1=2,
+            depth2=4,
+
+            # Sliding window (SW) parameter
+            n_windows=5,
+
+            # Attention (AT) block parameter
+            attention='mha',  # Options: None, 'mha','mhla', 'cbam', 'se', 'improved_cbam'
+
+            # Temporal convolutional Fusion Network block (TCFN) parameters
+            tcn_depth=2,
+            tcn_kernelSize=4,
+            tcn_filters=32,
+            tcn_dropout=0.3,
+            drop2=0.1,
+            drop3=0.15,
+            drop4=0.15,
+
+            tcn_activation='elu',
+            
+            # Center Loss parameters
+            center_alpha=0.5,  # Learning rate for center updates
+        )
     elif (model_name == 'DB_ATCNet_MultiScale'):
         # Train using DB-ATCNet with Multi-Scale temporal convolutions
         model = models.DB_ATCNet_MultiScale(
@@ -508,8 +547,9 @@ def run():
         'patience': 100, 
         'lr': 0.0009,   
         'LearnCurves': True, 
-        'model': 'DB_ATCNet',
-        'n_folds': 5  # Number of folds for cross-validation
+        'model': 'DB_ATCNet_CenterLoss',  # Using Center Loss variant
+        'n_folds': 5,  # Number of folds for cross-validation
+        'center_loss_weight': 0.01,  # Lambda weight for center loss (try 0.001 to 0.1)
     }
 
     # Train the model using stratified k-fold cross-validation
@@ -590,23 +630,52 @@ def train_kfold(dataset_conf, train_conf, results_path):
         
         # Create a fresh model for each fold
         model = getModel(model_name)
-        model.compile(
-            loss=categorical_crossentropy, 
-            optimizer=Adam(learning_rate=lr), 
-            metrics=['accuracy']
-        )
         
-        # Callbacks
+        # Check if using Center Loss model (has dual outputs)
+        use_center_loss = model_name == 'DB_ATCNet_CenterLoss'
+        center_loss_weight = train_conf.get('center_loss_weight', 0.01)
+        
+        if use_center_loss:
+            # Compile with dual losses for Center Loss model
+            losses, loss_weights = get_center_loss_model_losses(center_loss_weight)
+            model.compile(
+                loss=losses,
+                loss_weights=loss_weights,
+                optimizer=Adam(learning_rate=lr), 
+                metrics={'softmax': 'accuracy'}  # Only track accuracy on softmax output
+            )
+        else:
+            model.compile(
+                loss=categorical_crossentropy, 
+                optimizer=Adam(learning_rate=lr), 
+                metrics=['accuracy']
+            )
+        
+        # Callbacks - monitor validation accuracy on softmax output
+        monitor_metric = 'val_softmax_accuracy' if use_center_loss else 'val_accuracy'
         callbacks = [
-            ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1,
+            ModelCheckpoint(filepath, monitor=monitor_metric, verbose=1,
                           save_best_only=True, save_weights_only=True, mode='max'),
-            EarlyStopping(monitor='val_accuracy', verbose=1, mode='max', patience=patience)
+            EarlyStopping(monitor=monitor_metric, verbose=1, mode='max', patience=patience)
         ]
+        
+        # Prepare training data
+        if use_center_loss:
+            # Center Loss model needs [X, y] as input and [y, dummy] as output
+            train_inputs = [X_train_scaled, y_train_onehot]
+            train_outputs = [y_train_onehot, np.zeros((len(y_train_onehot), 1))]
+            val_inputs = [X_test_scaled, y_test_onehot]
+            val_outputs = [y_test_onehot, np.zeros((len(y_test_onehot), 1))]
+            validation_data = (val_inputs, val_outputs)
+        else:
+            train_inputs = X_train_scaled
+            train_outputs = y_train_onehot
+            validation_data = (X_test_scaled, y_test_onehot)
         
         # Train
         history = model.fit(
-            X_train_scaled, y_train_onehot, 
-            validation_data=(X_test_scaled, y_test_onehot),
+            train_inputs, train_outputs, 
+            validation_data=validation_data,
             epochs=epochs, batch_size=batch_size, 
             callbacks=callbacks, verbose=1
         )
@@ -614,7 +683,13 @@ def train_kfold(dataset_conf, train_conf, results_path):
         
         # Load best weights and evaluate
         model.load_weights(filepath)
-        y_pred = model.predict(X_test_scaled).argmax(axis=-1)
+        
+        if use_center_loss:
+            # For center loss model, predict returns [softmax_output, center_loss]
+            predictions = model.predict([X_test_scaled, y_test_onehot])
+            y_pred = predictions[0].argmax(axis=-1)
+        else:
+            y_pred = model.predict(X_test_scaled).argmax(axis=-1)
         labels = y_test_onehot.argmax(axis=-1)
         
         acc = accuracy_score(labels, y_pred)
@@ -646,9 +721,13 @@ def train_kfold(dataset_conf, train_conf, results_path):
         if LearnCurves:
             plt.figure(figsize=(12, 4))
             
+            # Handle different metric names for Center Loss model
+            acc_key = 'softmax_accuracy' if use_center_loss else 'accuracy'
+            val_acc_key = 'val_softmax_accuracy' if use_center_loss else 'val_accuracy'
+            
             plt.subplot(1, 2, 1)
-            plt.plot(history.history['accuracy'], label='Train')
-            plt.plot(history.history['val_accuracy'], label='Validation')
+            plt.plot(history.history[acc_key], label='Train')
+            plt.plot(history.history[val_acc_key], label='Validation')
             plt.title(f'Fold {fold} - Accuracy')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')

@@ -3,12 +3,13 @@ import tensorflow as tf
 from keras.models import Model, Sequential
 from keras.layers import Dense, Dropout, Activation, AveragePooling2D, MaxPooling2D
 from keras.layers import Conv1D, Conv2D, SeparableConv2D, DepthwiseConv2D
-from keras.layers import BatchNormalization, LayerNormalization, Flatten, GlobalAveragePooling1D
+from keras.layers import BatchNormalization, LayerNormalization, Flatten
 from keras.layers import Add, Concatenate, Lambda, Input, Permute
 from keras.constraints import max_norm
 
 from keras import backend as K
 from attention_models import attention_block,eca_attention, improved_cbam_block
+from losses.center_loss import CenterLossLayer
 
 def DB_ATCNet(n_classes, in_chans=22, in_samples=1125, n_windows=3, attention=None,
            eegn_F1=16, eegn_D=2, eegn_kernelSize=64, eegn_poolSize=8, eegn_dropout=0.3,
@@ -26,7 +27,7 @@ def DB_ATCNet(n_classes, in_chans=22, in_samples=1125, n_windows=3, attention=No
                             kernLength=eegn_kernelSize, poolSize=eegn_poolSize,
                             in_chans=in_chans, dropout=eegn_dropout,drop1=drop1,depth1=depth1,depth2=depth2)
     # Improved CBAM (was ECA2)
-    block1 = improved_cbam_block(block1)
+    block1 = eca_attention(block1)
     block1 = Lambda(lambda x: x[:, :, -1, :])(block1)
 
     # Sliding window
@@ -67,6 +68,119 @@ def DB_ATCNet(n_classes, in_chans=22, in_samples=1125, n_windows=3, attention=No
 
     softmax = Activation('softmax', name='softmax')(sw_concat)
     return Model(inputs=input_1, outputs=softmax)
+
+
+def DB_ATCNet_CenterLoss(n_classes, in_chans=22, in_samples=1125, n_windows=3, attention=None,
+           eegn_F1=16, eegn_D=2, eegn_kernelSize=64, eegn_poolSize=8, eegn_dropout=0.3,
+           tcn_depth=2, tcn_kernelSize=4, tcn_filters=32, tcn_dropout=0.3,
+           tcn_activation='elu', fuse='average', drop1=0.35, drop2=0.1, drop3=0.15, drop4=0.15,
+           depth1=2, depth2=4, center_alpha=0.5):
+    """
+    DB-ATCNet with Center Loss for improved intra-class compactness.
+    
+    This variant adds a Center Loss term to encourage samples of the same class
+    to cluster tightly in the feature space, addressing the "Both Fists" confusion
+    problem where the class is spread out and overlaps with single-hand classes.
+    
+    Args:
+        n_classes: Number of output classes
+        in_chans: Number of EEG channels
+        in_samples: Number of time samples
+        n_windows: Number of sliding windows for temporal attention
+        attention: Type of attention mechanism ('mha', 'mhla', 'cbam', 'se', None)
+        eegn_F1, eegn_D, etc.: ADBC block parameters
+        tcn_depth, tcn_kernelSize, etc.: TCFN block parameters
+        center_alpha: Learning rate for center updates (0 to 1)
+        
+    Returns:
+        Model with:
+        - Inputs: [EEG data (1, channels, samples), Labels (n_classes,) one-hot]
+        - Outputs: [softmax predictions, center_loss value]
+        
+    Usage:
+        model = DB_ATCNet_CenterLoss(n_classes=4, ...)
+        losses, loss_weights = get_center_loss_model_losses(center_loss_weight=0.01)
+        model.compile(loss=losses, loss_weights=loss_weights, optimizer=..., metrics=['accuracy'])
+        
+        # During training, pass labels to both y and second input
+        model.fit([X_train, y_train], [y_train, np.zeros(len(y_train))], ...)
+    """
+    # Input 1: EEG data
+    input_1 = Input(shape=(1, in_chans, in_samples), name='eeg_input')
+    # Input 2: Labels (needed for center loss during training)
+    input_labels = Input(shape=(n_classes,), name='label_input')
+    
+    input_2 = Permute((3, 2, 1))(input_1)
+
+    regRate = .25
+    numFilters = eegn_F1
+    F2 = numFilters * eegn_D
+
+    # ADBC Block
+    block1 = ADBC(input_layer=input_2, F1=eegn_F1, D=eegn_D,
+                            kernLength=eegn_kernelSize, poolSize=eegn_poolSize,
+                            in_chans=in_chans, dropout=eegn_dropout, drop1=drop1, depth1=depth1, depth2=depth2)
+    # Improved CBAM (was ECA2)
+    block1 = improved_cbam_block(block1)
+    block1 = Lambda(lambda x: x[:, :, -1, :])(block1)
+
+    # Sliding window
+    sw_concat = []  # to store concatenated or averaged sliding window outputs
+    feature_for_center = None  # Will store features for center loss
+    
+    for i in range(n_windows):
+        st = i
+        end = block1.shape[1] - n_windows + i + 1
+        block2 = block1[:, st:end, :]
+
+        # The ATFC block includes the following MHA block and TCFN block
+
+        # MHA Block
+        block2 = attention_block(block2, attention)
+        # TCFN Block
+        block3 = TCFN(input_layer=block2, input_dimension=F2, depth=tcn_depth,
+                               kernel_size=tcn_kernelSize, filters=tcn_filters,
+                               dropout=tcn_dropout, activation=tcn_activation, drop2=drop2, drop3=drop3, drop4=drop4)
+
+        # Get feature maps of the last sequence
+        block3 = Lambda(lambda x: x[:, -1, :])(block3)
+        
+        # Store the feature for center loss (use last window's features)
+        feature_for_center = block3
+
+        # Outputs of sliding window: Average_after_dense or concatenate_then_dense
+        if (fuse == 'average'):
+            sw_concat.append(Dense(n_classes, kernel_constraint=max_norm(regRate))(block3))
+        elif (fuse == 'concat'):
+            if i == 0:
+                sw_concat = block3
+            else:
+                sw_concat = Concatenate()([sw_concat, block3])
+
+    if (fuse == 'average'):
+        if len(sw_concat) > 1:  # more than one window
+            sw_concat = tf.keras.layers.Average()(sw_concat[:])
+        else:  # one window (# windows = 1)
+            sw_concat = sw_concat[0]
+    elif (fuse == 'concat'):
+        sw_concat = Dense(n_classes, kernel_constraint=max_norm(regRate))(sw_concat)
+
+    # Softmax output
+    softmax = Activation('softmax', name='softmax')(sw_concat)
+    
+    # Center Loss computation
+    # feature_for_center has shape (batch, tcn_filters)
+    center_loss = CenterLossLayer(
+        num_classes=n_classes, 
+        feature_dim=tcn_filters, 
+        alpha=center_alpha,
+        name='center_loss'
+    )([feature_for_center, input_labels])
+    
+    # Reshape center_loss to (batch, 1) for proper output shape
+    center_loss_output = Lambda(lambda x: tf.reshape(x, (-1, 1)), name='center_loss_output')(center_loss)
+    
+    return Model(inputs=[input_1, input_labels], outputs=[softmax, center_loss_output])
 
 def ADBC(input_layer, F1=4, kernLength=64, poolSize=8, D=2, in_chans=22, dropout=0.1,drop1=0.3,depth1=2,depth2=4):
     F2 = F1 * D
