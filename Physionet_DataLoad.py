@@ -195,6 +195,7 @@ def load_physionet_raw(path):
 
     xs = list()
     ys = list()
+    ch_names = None
     for subject in subjects:
         x, y, ch_names = load_subject_data(subject, path, True)
         print(f"Subject {subject}: {x.shape}")
@@ -210,5 +211,21 @@ def load_physionet_raw(path):
     # Get integer labels for stratification
     y_labels = np.argmax(y_one_hot, axis=1)
 
+    # Convert ch_names from first subject (typically consistent)
+    # We need to access the first subject's channel names.
+    # The loop overwrites 'ch_names' variable, so after loop it holds the last subject's names.
+    # Ideally we grab it from the first Subject.
+    
+    # We need to make sure ch_names is available. It is defined in the loop.
+    # Since subjects list is not empty, ch_names will be defined.
+    # But let's be safe.
+    
+    # We can just return the last ch_names since they should be identical.
+    
     print(f"Total data shape: {data_x.shape}, Labels shape: {y_one_hot.shape}")
-    return data_x, y_one_hot, y_labels, N_ch
+    # ch_names will be from the last iteration, which is fine.
+    # But we need to ensure it's accessible.
+    # It is a local variable in the loop. Python leaks loop variables, so it's fine.
+    
+    return data_x, y_one_hot, y_labels, N_ch, ch_names
+

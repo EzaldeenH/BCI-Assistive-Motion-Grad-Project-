@@ -15,6 +15,7 @@ from sklearn.model_selection import StratifiedKFold
 
 import models
 from Physionet_DataLoad import load_physionet, load_physionet_raw, standardize_data
+from mixup_generator import MixupGenerator
 
 
 # %%
@@ -505,11 +506,13 @@ def run():
     train_conf = {
         'batch_size': 32, 
         'epochs': 500, 
-        'patience': 100, 
+        'patience': 400,
         'lr': 0.0009,   
         'LearnCurves': True, 
         'model': 'DB_ATCNet',
-        'n_folds': 5  # Number of folds for cross-validation
+        'n_folds': 5,  # Number of folds for cross-validation
+        'mixup_type': 'channel', # Options: 'linear', 'channel', None
+        'mixup_alpha': 0.2
     }
 
     # Train the model using stratified k-fold cross-validation
@@ -547,7 +550,7 @@ def train_kfold(dataset_conf, train_conf, results_path):
     
     # Load all data (without train/test split)
     print("[DEBUG] Loading all data...")
-    X_all, y_all_onehot, y_labels, n_channels = load_physionet_raw(data_path)
+    X_all, y_all_onehot, y_labels, n_channels, ch_names = load_physionet_raw(data_path)
     print(f"[DEBUG] Data loaded: X_all={X_all.shape}, y_all={y_all_onehot.shape}")
     
     # Initialize stratified k-fold
@@ -603,13 +606,39 @@ def train_kfold(dataset_conf, train_conf, results_path):
             EarlyStopping(monitor='val_accuracy', verbose=1, mode='max', patience=patience)
         ]
         
+        # Create Mixup Generator
+        mixup_type = train_conf.get('mixup_type', None)
+        mixup_alpha = train_conf.get('mixup_alpha', 0.2)
+        
+        if mixup_type:
+            print(f"Using Mixup Generator: Type={mixup_type}, Alpha={mixup_alpha}")
+            train_generator = MixupGenerator(
+                X_train_scaled, y_train_onehot, 
+                batch_size=batch_size, 
+                alpha=mixup_alpha, 
+                mixup_type=mixup_type,
+                ch_names=ch_names
+            )
+        else:
+            print("Using Standard Training (No Mixup)")
+            train_generator = None
+
         # Train
-        history = model.fit(
-            X_train_scaled, y_train_onehot, 
-            validation_data=(X_test_scaled, y_test_onehot),
-            epochs=epochs, batch_size=batch_size, 
-            callbacks=callbacks, verbose=1
-        )
+        if train_generator:
+             history = model.fit(
+                train_generator,
+                validation_data=(X_test_scaled, y_test_onehot),
+                epochs=epochs,
+                callbacks=callbacks, 
+                verbose=1
+            )
+        else:
+            history = model.fit(
+                X_train_scaled, y_train_onehot, 
+                validation_data=(X_test_scaled, y_test_onehot),
+                epochs=epochs, batch_size=batch_size, 
+                callbacks=callbacks, verbose=1
+            )
         fold_histories.append(history)
         
         # Load best weights and evaluate
